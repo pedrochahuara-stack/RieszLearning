@@ -88,7 +88,8 @@ class RieszNet:
         if (yval is not None) and (not torch.is_tensor(yval)):
             yval = torch.Tensor(yval).to(self.device)
         y = y.reshape(-1, 1)
-        yval = yval.reshape(-1, 1)
+        if yval is not None:
+            yval = yval.reshape(-1, 1)
 
         self.train_ds = TensorDataset(X, y)
         self.train_dl = DataLoader(self.train_ds, batch_size=bs, shuffle=True)
@@ -129,7 +130,7 @@ class RieszNet:
             best_learner_state_dict = copy.deepcopy(self.learner.state_dict())
             lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizerD, mode='min', factor=0.5,
                 patience=5, threshold=0.0, threshold_mode='abs', cooldown=0, min_lr=0,
-                eps=1e-08, verbose=(self.verbose>0))
+                eps=1e-08)
 
         for epoch in range(n_epochs):
 
@@ -242,10 +243,10 @@ class RieszNet:
     def get_model(self, model):
         if model == 'final':
             return torch.load(os.path.join(self.model_dir,
-                                           "epoch{}".format(self.n_epochs - 1)))
+                                           "epoch{}".format(self.n_epochs - 1)), weights_only=False)
         if model == 'earlystop':
             return torch.load(os.path.join(self.model_dir,
-                                           "earlystop"))
+                                           "earlystop"), weights_only=False)
 
         raise AttributeError("Not implemented")
 
@@ -419,7 +420,7 @@ class RieszNetRR:
             best_learner_state_dict = copy.deepcopy(self.learner.state_dict())
             lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizerD, mode='min', factor=0.5,
                 patience=5, threshold=0.0, threshold_mode='abs', cooldown=0, min_lr=0,
-                eps=1e-08, verbose=(self.verbose>0))
+                eps=1e-08)
 
         for epoch in range(n_epochs):
 
@@ -522,10 +523,10 @@ class RieszNetRR:
     def get_model(self, model):
         if model == 'final':
             return torch.load(os.path.join(self.model_dir,
-                                           "epoch{}".format(self.n_epochs - 1)))
+                                           "epoch{}".format(self.n_epochs - 1)), weights_only=False)
         if model == 'earlystop':
             return torch.load(os.path.join(self.model_dir,
-                                           "earlystop"))
+                                           "earlystop"), weights_only=False)
 
         raise AttributeError("Not implemented")
 

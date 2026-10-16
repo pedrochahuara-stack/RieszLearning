@@ -1,0 +1,24 @@
+[project]
+name = "rieszlearning"
+version = "0.1.0"
+description = "RieszNet and ForestRiesz replication experiments"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "numpy==2.5.4",
+    "pandas==3.0.6",
+    "scipy==1.18.1",
+    "scikit-learn==1.9.1",
+    "torch==2.14.1",
+    "econml==0.17.0",
+    "statsmodels==0.15.0",
+    "matplotlib==3.11.2",
+    "joblib==1.6.0",
+    "tensorboard==2.21.0",
+]
+
+[dependency-groups]
+dev = ["ipykernel", "jupyterlab"]
+
+[tool.uv]
+package = false
