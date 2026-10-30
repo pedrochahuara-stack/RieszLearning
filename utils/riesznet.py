@@ -18,16 +18,25 @@ def mean_ci(data, confidence=0.95):
     h = se * scipy.stats.t.ppf((1 + confidence) / 2., n-1)
     return m, m-h, m+h
 
-def add_weight_decay(net, l2_value, skip_list=()):
-    decay, no_decay = [], []
+def add_weight_decay(net, l2_value, skip_list=(), *, riesz_l2=None):
+    decay, no_decay, riesz_decay = [], [], []
     for name, param in net.named_parameters():
         if not param.requires_grad:
             continue  # frozen weights
         if len(param.shape) == 1 or name.endswith(".bias") or name in skip_list:
             no_decay.append(param)
+        elif riesz_l2 is not None and name.startswith((
+                'learner.riesz_nn.', 'learner.riesz_poly.')):
+            riesz_decay.append(param)
         else:
             decay.append(param)
-    return [{'params': no_decay, 'weight_decay': 0.}, {'params': decay, 'weight_decay': l2_value}]
+    groups = [{'params': no_decay, 'weight_decay': 0.},
+              {'params': decay, 'weight_decay': l2_value}]
+    if riesz_l2 is not None:
+        if not riesz_decay:
+            raise ValueError("riesz_l2 requires learner.riesz_nn or learner.riesz_poly weights")
+        groups.append({'params': riesz_decay, 'weight_decay': riesz_l2})
+    return groups
 
 def L1_reg(net, l1_value, skip_list=()):
     L1_reg_loss = 0.0
@@ -107,12 +116,19 @@ class RieszNet:
         return X, y, Xval, yval
 
     def _train(self, X, y, *, Xval, yval,
-               earlystop_rounds, earlystop_delta,
-               learner_l2, learner_l1, learner_lr,
+               earlystop_rounds, earlystop_delta, earlystop_metric,
+               scheduler_patience, validation_metrics_fn, secondary_checkpoint_metric,
+               learner_l2, riesz_l2, learner_l1, learner_lr,
                n_epochs, bs, target_reg, riesz_weight,
                optimizer):
 
-        parameters = add_weight_decay(self.learner, learner_l2)
+        parameters = add_weight_decay(self.learner, learner_l2, riesz_l2=riesz_l2)
+        self.training_history_ = []
+        self.validation_history_ = []
+        self.best_epoch_ = None
+        self.best_validation_metrics_ = None
+        self.secondary_best_epoch_ = None
+        self.secondary_best_validation_metrics_ = None
         if optimizer == 'adam':
             self.optimizerD = optim.Adam(parameters, lr=learner_lr)
         elif optimizer == 'rmsprop':
@@ -126,10 +142,12 @@ class RieszNet:
 
         if Xval is not None:
             min_eval = np.inf
+            secondary_min_eval = np.inf
+            secondary_learner_state_dict = None
             time_since_last_improvement = 0
             best_learner_state_dict = copy.deepcopy(self.learner.state_dict())
             lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizerD, mode='min', factor=0.5,
-                patience=5, threshold=0.0, threshold_mode='abs', cooldown=0, min_lr=0,
+                patience=scheduler_patience, threshold=0.0, threshold_mode='abs', cooldown=0, min_lr=0,
                 eps=1e-08)
 
         for epoch in range(n_epochs):
@@ -137,6 +155,9 @@ class RieszNet:
             if self.verbose > 0:
                 print("Epoch #", epoch, sep="")
 
+            # Reuse losses already computed for optimization; no extra train pass.
+            epoch_loss_sum = torch.zeros(4, dtype=torch.float64, device=X.device)
+            epoch_samples = 0
             for it, (xb, yb) in enumerate(self.train_dl):
 
                 self.learner.train()
@@ -146,16 +167,30 @@ class RieszNet:
                 if learner_l1 > 0.0:
                     L1_reg_loss = L1_reg(self.learner, learner_l1)
 
-                D_loss = torch.mean((yb - output[:, [0]]) ** 2)
-                D_loss += riesz_weight * torch.mean(- 2 * self.moment_fn(
+                regression_loss = torch.mean((yb - output[:, [0]]) ** 2)
+                riesz_loss = torch.mean(- 2 * self.moment_fn(
                     xb, riesz_fn, self.device) + output[:, [1]] ** 2)
-                D_loss += target_reg * torch.mean((yb - output[:, [2]])**2)
-                D_loss += L1_reg_loss
+                corrected_loss = torch.mean((yb - output[:, [2]])**2)
+                D_loss = (regression_loss + riesz_weight * riesz_loss
+                          + target_reg * corrected_loss + L1_reg_loss)
+                batch_losses = torch.stack((regression_loss.detach(), riesz_loss.detach(),
+                                            corrected_loss.detach(), D_loss.detach()))
+                epoch_loss_sum += len(xb) * batch_losses.to(torch.float64)
+                epoch_samples += len(xb)
 
                 self.optimizerD.zero_grad()
                 D_loss.backward()
                 self.optimizerD.step()
                 self.learner.eval()
+
+            train_values = (epoch_loss_sum / epoch_samples).cpu().tolist()
+            train_metrics = dict(zip(
+                ('train_regression', 'train_riesz_loss',
+                 'train_corrected_regression', 'train_objective'), train_values))
+            self.training_history_.append({'epoch': epoch + 1, **train_metrics})
+            if self.verbose > 0:
+                print("Training losses (batch averages):", *train_values[:3])
+                print("Training objective:", train_values[3])
 
             if Xval is not None:  # if early stopping was enabled we check the out of sample violation
                 output = self.learner(Xval)
@@ -164,16 +199,52 @@ class RieszNet:
                     Xval, riesz_fn, self.device) + output[:, [1]] ** 2).cpu().detach().numpy())
                 loss3 = np.mean(torch.mean((yval - output[:, [2]]) ** 2).cpu().detach().numpy())
 
-                self.curr_eval = loss1 + riesz_weight * loss2 + target_reg * loss3
+                validation_metrics = {
+                    'regression': float(loss1), 'riesz_loss': float(loss2),
+                    'corrected_regression': float(loss3),
+                    'joint': float(loss1 + riesz_weight * loss2 + target_reg * loss3),
+                }
+                if validation_metrics_fn is not None:
+                    with torch.no_grad():
+                        extra_metrics = validation_metrics_fn(Xval, yval, output.detach())
+                    if validation_metrics.keys() & extra_metrics.keys():
+                        raise ValueError("Custom validation metrics must use distinct names")
+                    validation_metrics.update({k: float(v) for k, v in extra_metrics.items()})
+                if earlystop_metric not in validation_metrics:
+                    raise ValueError("Early-stop metric is missing from validation metrics: "
+                                     + earlystop_metric)
+                if secondary_checkpoint_metric is not None:
+                    if secondary_checkpoint_metric not in validation_metrics:
+                        raise ValueError("Secondary checkpoint metric is missing: "
+                                         + secondary_checkpoint_metric)
+                    secondary_eval = validation_metrics[secondary_checkpoint_metric]
+                    if np.isfinite(secondary_eval) and secondary_eval < secondary_min_eval:
+                        secondary_min_eval = secondary_eval
+                        secondary_learner_state_dict = copy.deepcopy(self.learner.state_dict())
+                        self.secondary_best_epoch_ = epoch + 1
+                        self.secondary_best_validation_metrics_ = validation_metrics.copy()
+                self.curr_eval = validation_metrics[earlystop_metric]
+                if not np.isfinite(self.curr_eval):
+                    raise ValueError("Early-stop metric must be finite")
                 lr_scheduler.step(self.curr_eval)
+                self.validation_history_.append({
+                    'epoch': epoch + 1, **train_metrics, **validation_metrics,
+                    'learning_rate': self.optimizerD.param_groups[0]['lr'],
+                })
 
                 if self.verbose > 0:
                     print("Validation losses:", loss1, loss2, loss3)
+                    print("Early-stop metric ({}):".format(earlystop_metric), self.curr_eval)
+                    if validation_metrics_fn is not None:
+                        print("Validation diagnostics:", extra_metrics)
+                    print("Learning rate:", self.optimizerD.param_groups[0]['lr'])
                 if min_eval > self.curr_eval + earlystop_delta:
                     min_eval = self.curr_eval
                     time_since_last_improvement = 0
                     best_learner_state_dict = copy.deepcopy(
                         self.learner.state_dict())
+                    self.best_epoch_ = epoch + 1
+                    self.best_validation_metrics_ = validation_metrics.copy()
                 else:
                     time_since_last_improvement += 1
                     if time_since_last_improvement > earlystop_rounds:
@@ -187,6 +258,11 @@ class RieszNet:
 
         self.n_epochs = epoch + 1
         if Xval is not None:
+            if secondary_checkpoint_metric is not None:
+                if secondary_learner_state_dict is None:
+                    raise ValueError("No finite secondary checkpoint metric was observed")
+                self.learner.load_state_dict(secondary_learner_state_dict)
+                torch.save(self.learner, os.path.join(self.model_dir, "secondary"))
             self.learner.load_state_dict(best_learner_state_dict)
             torch.save(self.learner, os.path.join(
                 self.model_dir, "earlystop"))
@@ -194,8 +270,9 @@ class RieszNet:
         return self
 
     def fit(self, X, y, Xval=None, yval=None, *,
-            earlystop_rounds=20, earlystop_delta=0,
-            learner_l2=1e-3, learner_l1=0, learner_lr=0.001,
+            earlystop_rounds=20, earlystop_delta=0, earlystop_metric='joint',
+            scheduler_patience=5, validation_metrics_fn=None, secondary_checkpoint_metric=None,
+            learner_l2=1e-3, riesz_l2=None, learner_l1=0, learner_lr=0.001,
             n_epochs=100, bs=100, target_reg=.1, riesz_weight=1.0, optimizer='adam',
             warm_start=False, logger=None, model_dir='.', device=None, verbose=0):
         """
@@ -207,7 +284,23 @@ class RieszNet:
         yval : validation labels
         earlystop_rounds : how many epochs to wait for an out of sample improvement
         earlystop_delta : min increment for improvement for early stopping
+        earlystop_metric : 'joint' (default) monitors the weighted validation objective;
+            'regression' monitors the first head's validation MSE for checkpoint
+            selection, learning-rate scheduling, and early stopping. May also name
+            a metric returned by validation_metrics_fn. Training always uses the
+            full joint objective.
+        scheduler_patience : epochs without improvement before reducing learning rate
+        secondary_checkpoint_metric : optional validation metric to independently
+            minimize and save as model='secondary'. Does not control scheduling or
+            stopping; considers only epochs actually run. Selected epoch/metrics
+            are secondary_best_epoch_ and secondary_best_validation_metrics_.
+        validation_metrics_fn : optional callable (Xval, yval, output) returning
+            scalar diagnostics as a dict; runs without gradients. Output has
+            columns g, a, and corrected g. History and selected metrics are exposed
+            as validation_history_ and best_validation_metrics_ (epochs are 1-based).
         learner_l2 : l2_regularization of parameters of learner
+        riesz_l2 : optional weight decay for BHP learner.riesz_nn and riesz_poly
+            weights only. Shared layers keep learner_l2; biases remain unpenalized.
         learner_l1 : l1_regularization of parameters of learner
         learner_lr : learning rate of the Adam optimizer for learner
         n_epochs : how many passes over the data
@@ -221,7 +314,23 @@ class RieszNet:
         model_dir : folder where to store the learned models after every epoch
         device : name of device on which to perform all computation
         verbose : whether to print messages related to progress of training
+            Includes sample-weighted training batch averages of the three losses
+            and objective (including L1, excluding optimizer weight decay). Stored
+            in training_history_ and also in validation_history_ when available.
+            Training averages use the changing model during the epoch; validation
+            losses use the fixed model at the end of the epoch.
         """
+
+        if earlystop_metric not in ('joint', 'regression') and validation_metrics_fn is None:
+            raise ValueError("Custom earlystop_metric requires validation_metrics_fn")
+        if secondary_checkpoint_metric is not None:
+            if Xval is None or yval is None:
+                raise ValueError("A secondary checkpoint requires validation data and labels")
+            if (secondary_checkpoint_metric not in ('joint', 'regression')
+                    and validation_metrics_fn is None):
+                raise ValueError("Custom secondary checkpoint metric requires validation_metrics_fn")
+        if riesz_l2 is not None and riesz_l2 < 0:
+            raise ValueError("riesz_l2 must be nonnegative")
 
         X, y, Xval, yval = self._pretrain(X, y, Xval, yval, bs=bs, warm_start=warm_start,
                                  logger=logger, model_dir=model_dir,
@@ -229,7 +338,11 @@ class RieszNet:
 
         self._train(X, y, Xval=Xval, yval=yval,
                     earlystop_rounds=earlystop_rounds, earlystop_delta=earlystop_delta,
-                    learner_l2=learner_l2, learner_l1=learner_l1,
+                    earlystop_metric=earlystop_metric,
+                    scheduler_patience=scheduler_patience,
+                    validation_metrics_fn=validation_metrics_fn,
+                    secondary_checkpoint_metric=secondary_checkpoint_metric,
+                    learner_l2=learner_l2, riesz_l2=riesz_l2, learner_l1=learner_l1,
                     learner_lr=learner_lr, n_epochs=n_epochs, bs=bs,
                     target_reg=target_reg, riesz_weight=riesz_weight,
                     optimizer=optimizer)
@@ -247,6 +360,10 @@ class RieszNet:
         if model == 'earlystop':
             return torch.load(os.path.join(self.model_dir,
                                            "earlystop"), weights_only=False)
+        if model == 'secondary':
+            if self.secondary_best_epoch_ is None:
+                raise ValueError("No secondary checkpoint was configured during fit")
+            return torch.load(os.path.join(self.model_dir, "secondary"), weights_only=False)
 
         raise AttributeError("Not implemented")
 
@@ -255,7 +372,7 @@ class RieszNet:
         Parameters
         ----------
         X : (n, p) matrix of features
-        model : one of ('final', 'earlystop'), whether to use an average of models or the final
+        model : one of ('final', 'earlystop', 'secondary')
         Returns
         -------
         ypred, apred : (n, 2) matrix of learned regression and riesz representers g(X), a(X)
